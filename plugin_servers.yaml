@@ -1,0 +1,13 @@
+
+- name: first
+  socket: /tmp/blah.sock
+  exec: xxx
+  environment:
+    HINT: dont
+  args:
+    go
+
+- socket: /tmp/that.sock
+
+- name: third
+  exec: yyy
