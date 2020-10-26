@@ -46,14 +46,14 @@ end
 
 function external_plugins.manage_servers()
   if ngx.worker.id() ~= 0 then
-    print("only worker #0 can manage")
+    kong.log.notice("only worker #0 can manage")
     return
   end
   assert(not _servers, "don't call manage_servers() more than once")
   _servers = {}
 
   if not kong.configuration.external_plugins_config then
-    print ("no external plugins")
+    kong.log.info("no external plugins")
     return
   end
 
