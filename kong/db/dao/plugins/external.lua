@@ -8,22 +8,25 @@ local kong = kong
 local external_plugins = {}
 
 local _servers
-local _plugin_schemas
+local _plugin_infos
 
 
 
 local function register_plugin_info(server_def, plugin_info)
-  if _plugin_schemas[plugin_info.name] then
+  if _plugin_infos[plugin_info.name] then
     kong.log.error(string.format("Duplicate plugin name [%s] by %s and %s",
-      plugin_info.name, _plugin_schemas[plugin_info.name].server_def.name, server_def.name))
+      plugin_info.name, _plugin_infos[plugin_info.name].server_def.name, server_def.name))
     return
   end
 
-  _plugin_schemas[plugin_info.name] = {
+  _plugin_infos[plugin_info.name] = {
     server_def = server_def,
     name = plugin_info.name,
+    PRIORITY = plugin_info.priority,
+    VERSION = plugin_info.version,
     schema = plugin_info.schema,
   }
+  -- TODO: add phase closures
 end
 
 local function ask_info(server_def)
@@ -53,22 +56,32 @@ local function ask_info(server_def)
   end
 end
 
-function external_plugins.load_schemas()
+local function load_all_infos()
   if not kong.configuration.external_plugins_config then
     kong.log.info("no external plugins")
     return
   end
 
-  if _plugin_schemas then
-    return _plugin_schemas
+  if not _plugin_infos then
+    local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
+    _plugin_infos = {}
+
+    for i, server_def in ipairs(conf) do
+      ask_info(server_def)
+    end
   end
 
-  local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
-  _plugin_schemas = {}
+  return _plugin_infos
+end
 
-  for i, server_def in ipairs(conf) do
-    ask_info(server_def)
-  end
+
+function external_plugins.load_plugin(plugin_name)
+  return load_all_infos()[plugin_name]
+end
+
+function external_plugins.load_schema(plugin_name)
+  local plugin_info = external_plugins.load_plugin(plugin_name)
+  return plugin_info and plugin_info.schema
 end
 
 
