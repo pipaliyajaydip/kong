@@ -6,7 +6,71 @@ local logging = require "logging"
 local kong = kong
 
 local external_plugins = {}
+
 local _servers
+local _plugin_schemas
+
+
+
+local function register_plugin_info(server_def, plugin_info)
+  if _plugin_schemas[plugin_info.name] then
+    kong.log.error(string.format("Duplicate plugin name [%s] by %s and %s",
+      plugin_info.name, _plugin_schemas[plugin_info.name].server_def.name, server_def.name))
+    return
+  end
+
+  _plugin_schemas[plugin_info.name] = {
+    server_def = server_def,
+    name = plugin_info.name,
+    schema = plugin_info.schema,
+  }
+end
+
+local function ask_info(server_def)
+  if not server_def.info_cmd then
+    kong.log.info(string.format("No info query for %s", server_def.name))
+    return
+  end
+
+  local fd, err = io.popen(server_def.info_cmd)
+  if not fd then
+    local msg = string.format("loading plugins info from [%s]:\n", server_def.name)
+    kong.log.error(msg, err)
+    return
+  end
+
+  local infos_dump = fd:read("*a")
+  fd:close()
+  local infos = lyaml.load(infos_dump)
+  if type(infos) ~= "table" then
+    kong.log.error(string.format("Not a plugin info table: \n%s\n%s",
+        server_def.info_cmd, infos_dump))
+    return
+  end
+
+  for _, plugin_info in ipairs(infos) do
+    register_plugin_info(server_def, plugin_info)
+  end
+end
+
+function external_plugins.load_schemas()
+  if not kong.configuration.external_plugins_config then
+    kong.log.info("no external plugins")
+    return
+  end
+
+  if _plugin_schemas then
+    return _plugin_schemas
+  end
+
+  local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
+  _plugin_schemas = {}
+
+  for i, server_def in ipairs(conf) do
+    ask_info(server_def)
+  end
+end
+
 
 local function handle_server(server_def)
   if not server_def.socket then
@@ -72,7 +136,7 @@ function external_plugins.manage_servers()
       kong.log.error(err)
     else
 
-      servers[#servers + 1] = server
+      _servers[#_servers + 1] = server
     end
   end
 end

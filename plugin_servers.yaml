@@ -6,8 +6,10 @@
     HINT: dont
   args:
     go
+  info_cmd: xxx --get_plugins_info
 
-- socket: /tmp/that.sock
+- name: sec
+  socket: /tmp/that.sock
 
 - name: third
   exec: yyy
