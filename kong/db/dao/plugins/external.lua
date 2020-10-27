@@ -1,9 +1,12 @@
 local pl_file = require "pl.file"
 local lyaml = require "lyaml"
+local raw_log = require "ngx.errlog".raw_log
 
 local logging = require "logging"
 
+local ngx = ngx
 local kong = kong
+local ngx_INFO = ngx.INFO
 
 local external_plugins = {}
 
@@ -158,10 +161,25 @@ Process management
 Servers that specify an `.exec` field are launched and managed by Kong.
 This is an attempt to duplicate the smallest reasonable subset of systemd.
 
-Each process specifies executable, arguments and environment.  If it dies,
-Kong logs the event and respawns it.
+Each process specifies executable, arguments and environment.
+Stdout and stderr are joined and logged, if it dies, Kong logs the event
+and respawns the server.
 
 --]]
+
+local function grab_logs(proc)
+  while true do
+    local data, err, partial = proc:stdout_read_line()
+    local line = data or partial
+    if line and line ~= "" then
+      raw_log(ngx_INFO, "[go-pluginserver] " .. line)
+    end
+
+    if not data and err == "closed" then
+      return
+    end
+  end
+end
 
 local function handle_server(server_def)
   if not server_def.socket then
@@ -185,6 +203,7 @@ local function handle_server(server_def)
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
 
         while true do
+          grab_logs(server_def.proc)
           local ok, reason, status = server_def.proc:wait()
           if ok ~= nil or reason == "exited" then
             kong.log.notice("external pluginserver '", server_def.name, "' terminated: ", tostring(reason), " ", tostring(status))
