@@ -3,6 +3,7 @@ local lyaml = require "lyaml"
 local raw_log = require "ngx.errlog".raw_log
 
 local logging = require "logging"
+local rpc = require "mp_rpc"
 
 local ngx = ngx
 local kong = kong
@@ -145,7 +146,8 @@ end
 
 
 function external_plugins.load_plugin(plugin_name)
-  return load_all_infos()[plugin_name]
+  local plugin = load_all_infos()[plugin_name]
+    
 end
 
 function external_plugins.load_schema(plugin_name)
@@ -201,6 +203,8 @@ local function handle_server(server_def)
           server_def.exec, table.unpack(server_def.args or {})
         }, { environ = server_def.environment }))
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
+
+        server_def.rpc = rpc.new(server_def.socket)
 
         while true do
           grab_logs(server_def.proc)
