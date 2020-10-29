@@ -14,6 +14,7 @@ local external_plugins = {}
 local _servers
 local _plugin_infos
 
+local save_for_later = {}
 
 
 --[[
@@ -27,7 +28,7 @@ name: (required) a unique string.  Shouldn't collide with Lua packages available
 socket: (required) path of a unix domain socket to use for RPC.
 exec: (optional) executable file of the server.  If omitted, the server process won't be managed by Kong.
 args: (optional) a list of strings to be passed as command line arguments.
-env: (optional) a {string:string} map to be passed as environment varialbes.
+env: (optional) a {string:string} map to be passed as environment variables.
 info_cmd: (optional) command line to request plugin info.
 
 --]]
@@ -48,6 +49,116 @@ CONSIDER:
 
 --]]
 
+
+
+--[[
+--]]
+
+
+local get_instance_id
+do
+  local instances = {}
+
+  function get_instance_id(plugin, conf)
+    local key = type(conf) == "table" and conf.__key__ or plugin.name
+    local instance_info = instances[key]
+
+    while instance_info and not instance_info.id do
+      -- some other thread is already starting an instance
+      ngx.sleep(0)
+      instance_info = instances[key]
+    end
+
+    if instance_info
+      and instance_info.id
+      and instance_info.seq == conf.__seq__
+    then
+      -- exact match, return it
+      return instance_info.id
+    end
+
+    local old_instance_id = instance_info and instance_info.id
+    if not instance_info then
+      -- we're the first, put something to claim
+      instance_info = {
+        conf = conf,
+        seq = conf.__seq__,
+      }
+      instances[key] = instance_info
+    else
+
+      -- there already was something, make it evident that we're changing it
+      instance_info.id = nil
+    end
+
+    local status, err = plugin.rpc:call("plugin.StartInstance", {
+      Name = plugin_name,
+      Config = cjson_encode(conf)
+    })
+    if status == nil then
+      kong.log.err("starting instance: ", err)
+      -- remove claim, some other thread might succeed
+      instances[key] = nil
+      error(err)
+    end
+
+    instance_info.id = status.Id
+    instance_info.conf = conf
+    instance_info.seq = conf.__seq__
+    instance_info.Config = status.Config
+
+    if old_instance_id then
+      -- there was a previous instance with same key, close it
+      rpc_call("plugin.CloseInstance", old_instance_id)
+      -- don't care if there's an error, maybe other thread closed it first.
+    end
+
+    return status.Id
+  end
+end
+
+local function build_phases(plugin)
+  for _, phase in ipairs(plugin.phases) do
+    if phase == "log" then
+      plugin[phase] = function(self, conf)
+        local saved = {
+          serialize_data = kong.log.serialize(),
+          ngx_ctx = ngx.ctx,
+          ctx_shared = kong.ctx.shared,
+        }
+
+        ngx_timer_at(0, function()
+          local co = coroutine.running()
+          save_for_later[co] = saved
+
+          local instance_id = get_instance_id(self.name, conf)
+          local _, err = bridge_loop(instance_id, phase)
+          if err and string.match(err, "No plugin instance") then
+            instance_id = reset_and_get_instance(self.name, conf)
+            bridge_loop(instance_id, phase)
+          end
+
+          save_for_later[co] = nil
+        end)
+      end
+
+    else
+      plugin[phase] = function(self, conf)
+        local instance_id = get_instance_id(plugin_name, conf)
+        local _, err = bridge_loop(instance_id, phase)
+        if err and string.match(err, "No plugin instance") then
+          instance_id = reset_and_get_instance(self.name, conf)
+          bridge_loop(instance_id, phase)
+        end
+      end
+    end
+  end
+
+  loaded_plugins[plugin_name] = plugin
+  return plugin
+end
+
+
 --[[
 
 Plugin info requests
@@ -59,7 +170,7 @@ non-yielding phases, but was considered dangerous.  The alternative is to use
 `io.popen(cmd)` to ask fot that info.
 
 
-In the externel plugins configuration, the `.info_cmd` field contains a string
+In the external plugins configuration, the `.info_cmd` field contains a string
 to be executed as a command line.  The output should be a JSON string that decodes
 as an array of objects, each defining the name, priority, version and schema of one
 plugin.
@@ -69,6 +180,7 @@ plugin.
       "priority": ... ,
       "version": ... ,
       "schema": ... ,
+      "phases": [ phase_names ... ],
     },
     {
       ...
@@ -95,8 +207,8 @@ local function register_plugin_info(server_def, plugin_info)
     PRIORITY = plugin_info.priority,
     VERSION = plugin_info.version,
     schema = plugin_info.schema,
+    phases = plugin_info.phases,
   }
-  -- TODO: add phase closures
 end
 
 local function ask_info(server_def)
@@ -147,7 +259,7 @@ end
 
 function external_plugins.load_plugin(plugin_name)
   local plugin = load_all_infos()[plugin_name]
-    
+  return build_phases(plugin)
 end
 
 function external_plugins.load_schema(plugin_name)
