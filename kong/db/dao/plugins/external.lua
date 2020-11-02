@@ -52,10 +52,13 @@ CONSIDER:
 
 
 --[[
+
+Instance_id/conf   relation
+
 --]]
 
 
-local get_instance_id
+local get_instance_id, reset_instance
 do
   local instances = {}
 
@@ -115,8 +118,68 @@ do
 
     return status.Id
   end
+
+  function reset_instance(plugin_name, conf)
+    local key = type(conf) == "table" and conf.__key__ or plugin_name
+    instances[key] = nil
+  end
 end
 
+--[[
+
+--- Event loop -- instance reconnection
+
+--]]
+
+local function bridge_loop(instance_id, phase)
+  local step_in, err = rpc_call("plugin.HandleEvent", {
+    InstanceId = instance_id,
+    EventName = phase,
+  })
+  if not step_in then
+    return step_in, err
+  end
+
+  local event_id = step_in.EventId
+
+  while true do
+    if step_in.Data == "ret" then
+      break
+    end
+
+    local pdk_res, pdk_err = call_pdk_method(
+      step_in.Data.Method,
+      step_in.Data.Args)
+
+    local step_method, step_res = get_step_method(step_in, pdk_res, pdk_err)
+
+    step_in, err = rpc_call(step_method, {
+      EventId = event_id,
+      Data = step_res,
+    })
+    if not step_in then
+      return step_in, err
+    end
+  end
+end
+
+
+local function handle_event(plugin_name, conf, phase)
+  local instance_id = get_instance_id(plugin_name, conf)
+  local _, err = bridge_loop(instance_id, phase)
+
+  if err then
+    kong.log.err(err)
+
+    if string.match(err, "No plugin instance") then
+      reset_instance(plugin_name, conf)
+      return handle_event(plugin_name, conf, phase)
+    end
+  end
+end
+
+
+--- Phase closures
 local function build_phases(plugin)
   for _, phase in ipairs(plugin.phases) do
     if phase == "log" then
@@ -131,12 +194,7 @@ local function build_phases(plugin)
           local co = coroutine.running()
           save_for_later[co] = saved
 
-          local instance_id = get_instance_id(self.name, conf)
-          local _, err = bridge_loop(instance_id, phase)
-          if err and string.match(err, "No plugin instance") then
-            instance_id = reset_and_get_instance(self.name, conf)
-            bridge_loop(instance_id, phase)
-          end
+          handle_event(self.name, conf, phase)
 
           save_for_later[co] = nil
         end)
@@ -144,17 +202,11 @@ local function build_phases(plugin)
 
     else
       plugin[phase] = function(self, conf)
-        local instance_id = get_instance_id(plugin_name, conf)
-        local _, err = bridge_loop(instance_id, phase)
-        if err and string.match(err, "No plugin instance") then
-          instance_id = reset_and_get_instance(self.name, conf)
-          bridge_loop(instance_id, phase)
-        end
+        handle_event(self.name, conf, phase)
       end
     end
   end
 
-  loaded_plugins[plugin_name] = plugin
   return plugin
 end
 
@@ -257,9 +309,15 @@ local function load_all_infos()
 end
 
 
+local loaded_plugins = {}
+
 function external_plugins.load_plugin(plugin_name)
-  local plugin = load_all_infos()[plugin_name]
-  return build_phases(plugin)
+  if not loaded_plugins[plugin_name] then
+    local plugin = load_all_infos()[plugin_name]
+    loaded_plugins[plugin_name] = build_phases(plugin)
+  end
+
+  return loaded_plugins[plugin_name]
 end
 
 function external_plugins.load_schema(plugin_name)
