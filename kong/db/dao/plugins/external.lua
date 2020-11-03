@@ -50,6 +50,8 @@ CONSIDER:
 --]]
 
 
+local rpc_notifications = {}
+
 
 --[[
 
@@ -62,8 +64,8 @@ local get_instance_id, reset_instance
 do
   local instances = {}
 
-  function get_instance_id(plugin, conf)
-    local key = type(conf) == "table" and conf.__key__ or plugin.name
+  function get_instance_id(plugin_name, conf)
+    local key = type(conf) == "table" and conf.__key__ or plugin_name
     local instance_info = instances[key]
 
     while instance_info and not instance_info.id do
@@ -94,7 +96,9 @@ do
       instance_info.id = nil
     end
 
-    local status, err = plugin.rpc:call("plugin.StartInstance", {
+    local plugin_info = _plugin_infos[plugin_name]
+
+    local status, err = plugin_info.rpc:call("plugin.StartInstance", {
       Name = plugin_name,
       Config = cjson_encode(conf)
     })
@@ -109,10 +113,11 @@ do
     instance_info.conf = conf
     instance_info.seq = conf.__seq__
     instance_info.Config = status.Config
+    instance_info.rpc = plugin_info.rpc
 
     if old_instance_id then
       -- there was a previous instance with same key, close it
-      rpc_call("plugin.CloseInstance", old_instance_id)
+      plugin_info.rpc:call("plugin.CloseInstance", old_instance_id)
       -- don't care if there's an error, maybe other thread closed it first.
     end
 
@@ -122,6 +127,22 @@ do
   function reset_instance(plugin_name, conf)
     local key = type(conf) == "table" and conf.__key__ or plugin_name
     instances[key] = nil
+  end
+
+
+  --- serverPid notification sent by the pluginserver.  if it changes,
+  --- all instances tied to this RPC socket should be restarted.
+  function rpc_notifications:serverPid(n)
+    n = tonumber(n)
+    if self.pluginserver_pid and n ~= self.pluginserver_pid then
+      for key, instance in pairs(instances) do
+        if instance.rpc == self then
+          instances[key] = nil
+        end
+      end
+    end
+
+    self.pluginserver_pid = n
   end
 end
 
@@ -374,7 +395,7 @@ local function handle_server(server_def)
         }, { environ = server_def.environment }))
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
 
-        server_def.rpc = rpc.new(server_def.socket)
+        server_def.rpc = rpc.new(server_def.socket, rpc_notifications)
 
         while true do
           grab_logs(server_def.proc)

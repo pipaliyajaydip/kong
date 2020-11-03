@@ -9,10 +9,11 @@ Rpc.__index = Rpc
 
 Rpc.notifications_callbacks = {}
 
-function Rpc.new(socket_path)
+function Rpc.new(socket_path, notifications)
   return setmetatable({
     socket_path = socket_path,
     msg_id = 0,
+    notifications_callbacks = notifications,
   }, Rpc)
 end
 
