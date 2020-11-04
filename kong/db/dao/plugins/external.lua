@@ -152,6 +152,141 @@ do
   end
 end
 
+
+--[[
+
+Exposed API
+
+--]]
+
+
+-- global method search and cache
+local function index_table(table, field)
+  if table[field] then
+    return table[field]
+  end
+
+  local res = table
+  for segment, e in ngx.re.gmatch(field, "\\w+", "o") do
+    if res[segment[0]] then
+      res = res[segment[0]]
+    else
+      return nil
+    end
+  end
+  return res
+end
+
+
+local get_field
+do
+  local exposed_api = {
+    kong = kong,
+
+    ["kong.log.serialize"] = function()
+      return cjson_encode(preloaded_stuff.basic_serializer or basic_serializer.serialize(ngx))
+    end,
+
+    ["kong.nginx.get_var"] = function(v)
+      return ngx.var[v]
+    end,
+
+    ["kong.nginx.get_tls1_version_str"] = ngx_ssl.get_tls1_version_str,
+
+    ["kong.nginx.get_ctx"] = function(k)
+      return ngx.ctx[k]
+    end,
+
+    ["kong.nginx.set_ctx"] = function(k, v)
+      ngx.ctx[k] = v
+    end,
+
+    ["kong.ctx.shared.get"] = function(k)
+      return kong.ctx.shared[k]
+    end,
+
+    ["kong.ctx.shared.set"] = function(k, v)
+      kong.ctx.shared[k] = v
+    end,
+
+    ["kong.nginx.req_start_time"] = ngx.req.start_time,
+
+    ["kong.request.get_query"] = function(max)
+      return rpc.fix_mmap(kong.request.get_query(max))
+    end,
+
+    ["kong.request.get_headers"] = function(max)
+      return rpc.fix_mmap(kong.request.get_headers(max))
+    end,
+
+    ["kong.response.get_headers"] = function(max)
+      return rpc.fix_mmap(kong.response.get_headers(max))
+    end,
+
+    ["kong.service.response.get_headers"] = function(max)
+      return rpc.fix_mmap(kong.service.response.get_headers(max))
+    end,
+  }
+
+  local method_cache = {}
+
+  function get_field(method)
+    if method_cache[method] then
+      return method_cache[method]
+
+    else
+      method_cache[method] = index_table(exposed_api, method)
+      return method_cache[method]
+    end
+  end
+end
+
+
+local function call_pdk_method(cmd, args)
+  local method = get_field(cmd)
+  if not method then
+    kong.log.err("could not find pdk method: ", cmd)
+    return
+  end
+
+  if type(args) == "table" then
+    return method(unpack(args))
+  end
+
+  return method(args)
+end
+
+
+-- return objects via the appropriately typed StepXXX method
+local get_step_method
+do
+  local by_pdk_method = {
+    ["kong.client.get_credential"] = "plugin.StepCredential",
+    ["kong.client.load_consumer"] = "plugin.StepConsumer",
+    ["kong.client.get_consumer"] = "plugin.StepConsumer",
+    ["kong.client.authenticate"] = "plugin.StepCredential",
+    ["kong.node.get_memory_stats"] = "plugin.StepMemoryStats",
+    ["kong.router.get_route"] = "plugin.StepRoute",
+    ["kong.router.get_service"] = "plugin.StepService",
+    ["kong.request.get_query"] = "plugin.StepMultiMap",
+    ["kong.request.get_headers"] = "plugin.StepMultiMap",
+    ["kong.response.get_headers"] = "plugin.StepMultiMap",
+    ["kong.service.response.get_headers"] = "plugin.StepMultiMap",
+  }
+
+  function get_step_method(step_in, pdk_res, pdk_err)
+    if not pdk_res and pdk_err then
+      return "plugin.StepError", pdk_err
+    end
+
+    return ((type(pdk_res) == "table" and pdk_res._method)
+      or by_pdk_method[step_in.Data.Method]
+      or "plugin.Step"), pdk_res
+  end
+end
+
+
+
 --[[
 
 --- Event loop -- instance reconnection

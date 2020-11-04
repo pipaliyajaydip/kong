@@ -18,6 +18,34 @@ function Rpc.new(socket_path, notifications)
 end
 
 
+
+--- fix_mmap(t) : preprocess complex maps
+function Rpc.fix_mmap(t)
+  local o, empty = {}, true
+
+  for k, v in pairs(t) do
+    empty = false
+    if v == true then
+      o[k] = mp_empty_array
+
+    elseif type(v) == "string" then
+      o[k] = { v }
+
+    else
+      o[k] = v
+    end
+  end
+
+  if empty then
+    return mp_empty_map
+  end
+
+  return o
+end
+
+
+
+
 function Rpc:call(method, ...)
   self.msg_id = self.msg_id + 1
 
