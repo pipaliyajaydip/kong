@@ -60,6 +60,12 @@ Instance_id/conf   relation
 --]]
 
 
+--- get_instance_id: gets an ID to reference a plugin instance running in a
+--- pluginserver each configuration in the database is handled by a different
+--- instance.  Biggest complexity here is due to the remote (and thus non-atomic
+--- and fallible) operation of starting the instance at the server.
+---
+--- reset_instance: removes an instance from the table.
 local get_instance_id, reset_instance
 do
   local instances = {}
@@ -152,8 +158,8 @@ end
 
 --]]
 
-local function bridge_loop(instance_id, phase)
-  local step_in, err = rpc_call("plugin.HandleEvent", {
+local function bridge_loop(rpc, instance_id, phase)
+  local step_in, err = rpc:call("plugin.HandleEvent", {
     InstanceId = instance_id,
     EventName = phase,
   })
@@ -174,7 +180,7 @@ local function bridge_loop(instance_id, phase)
 
     local step_method, step_res = get_step_method(step_in, pdk_res, pdk_err)
 
-    step_in, err = rpc_call(step_method, {
+    step_in, err = rpc:call(step_method, {
       EventId = event_id,
       Data = step_res,
     })
@@ -185,16 +191,16 @@ local function bridge_loop(instance_id, phase)
 end
 
 
-local function handle_event(plugin_name, conf, phase)
+local function handle_event(rpc, plugin_name, conf, phase)
   local instance_id = get_instance_id(plugin_name, conf)
-  local _, err = bridge_loop(instance_id, phase)
+  local _, err = bridge_loop(rpc, instance_id, phase)
 
   if err then
     kong.log.err(err)
 
     if string.match(err, "No plugin instance") then
       reset_instance(plugin_name, conf)
-      return handle_event(plugin_name, conf, phase)
+      return handle_event(rpc, plugin_name, conf, phase)
     end
   end
 end
@@ -223,7 +229,7 @@ local function build_phases(plugin)
 
     else
       plugin[phase] = function(self, conf)
-        handle_event(self.name, conf, phase)
+        handle_event(self.rpc, self.name, conf, phase)
       end
     end
   end
@@ -276,6 +282,7 @@ local function register_plugin_info(server_def, plugin_info)
 
   _plugin_infos[plugin_info.name] = {
     server_def = server_def,
+    rpc = server_def.rpc,
     name = plugin_info.name,
     PRIORITY = plugin_info.priority,
     VERSION = plugin_info.version,
