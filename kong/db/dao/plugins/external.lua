@@ -9,12 +9,22 @@ local ngx = ngx
 local kong = kong
 local ngx_INFO = ngx.INFO
 
+--- module table
 local external_plugins = {}
+
 
 local _servers
 local _plugin_infos
 
+--- keep request data a bit longer, into the log timer
 local save_for_later = {}
+
+--- handle notifications from pluginservers
+local rpc_notifications = {}
+
+--- currently running plugin instances
+local running_instances = {}
+
 
 
 --[[
@@ -50,7 +60,6 @@ CONSIDER:
 --]]
 
 
-local rpc_notifications = {}
 
 
 --[[
@@ -64,93 +73,88 @@ Instance_id/conf   relation
 --- pluginserver each configuration in the database is handled by a different
 --- instance.  Biggest complexity here is due to the remote (and thus non-atomic
 --- and fallible) operation of starting the instance at the server.
----
+local function get_instance_id(plugin_name, conf)
+  local key = type(conf) == "table" and conf.__key__ or plugin_name
+  local instance_info = running_instances[key]
+
+  while instance_info and not instance_info.id do
+    -- some other thread is already starting an instance
+    ngx.sleep(0)
+    instance_info = running_instances[key]
+  end
+
+  if instance_info
+    and instance_info.id
+    and instance_info.seq == conf.__seq__
+  then
+    -- exact match, return it
+    return instance_info.id
+  end
+
+  local old_instance_id = instance_info and instance_info.id
+  if not instance_info then
+    -- we're the first, put something to claim
+    instance_info          = {
+      conf = conf,
+      seq = conf.__seq__,
+    }
+    running_instances[key] = instance_info
+  else
+
+    -- there already was something, make it evident that we're changing it
+    instance_info.id = nil
+  end
+
+  local plugin_info = _plugin_infos[plugin_name]
+
+  local status, err = plugin_info.rpc:call("plugin.StartInstance", {
+    Name = plugin_name,
+    Config = cjson_encode(conf)
+  })
+  if status == nil then
+    kong.log.err("starting instance: ", err)
+    -- remove claim, some other thread might succeed
+    running_instances[key] = nil
+    error(err)
+  end
+
+  instance_info.id = status.Id
+  instance_info.conf = conf
+  instance_info.seq = conf.__seq__
+  instance_info.Config = status.Config
+  instance_info.rpc = plugin_info.rpc
+
+  if old_instance_id then
+    -- there was a previous instance with same key, close it
+    plugin_info.rpc:call("plugin.CloseInstance", old_instance_id)
+    -- don't care if there's an error, maybe other thread closed it first.
+  end
+
+  return status.Id
+end
+
 --- reset_instance: removes an instance from the table.
-local get_instance_id, reset_instance
-do
-  local instances = {}
-
-  function get_instance_id(plugin_name, conf)
-    local key = type(conf) == "table" and conf.__key__ or plugin_name
-    local instance_info = instances[key]
-
-    while instance_info and not instance_info.id do
-      -- some other thread is already starting an instance
-      ngx.sleep(0)
-      instance_info = instances[key]
-    end
-
-    if instance_info
-      and instance_info.id
-      and instance_info.seq == conf.__seq__
-    then
-      -- exact match, return it
-      return instance_info.id
-    end
-
-    local old_instance_id = instance_info and instance_info.id
-    if not instance_info then
-      -- we're the first, put something to claim
-      instance_info = {
-        conf = conf,
-        seq = conf.__seq__,
-      }
-      instances[key] = instance_info
-    else
-
-      -- there already was something, make it evident that we're changing it
-      instance_info.id = nil
-    end
-
-    local plugin_info = _plugin_infos[plugin_name]
-
-    local status, err = plugin_info.rpc:call("plugin.StartInstance", {
-      Name = plugin_name,
-      Config = cjson_encode(conf)
-    })
-    if status == nil then
-      kong.log.err("starting instance: ", err)
-      -- remove claim, some other thread might succeed
-      instances[key] = nil
-      error(err)
-    end
-
-    instance_info.id = status.Id
-    instance_info.conf = conf
-    instance_info.seq = conf.__seq__
-    instance_info.Config = status.Config
-    instance_info.rpc = plugin_info.rpc
-
-    if old_instance_id then
-      -- there was a previous instance with same key, close it
-      plugin_info.rpc:call("plugin.CloseInstance", old_instance_id)
-      -- don't care if there's an error, maybe other thread closed it first.
-    end
-
-    return status.Id
-  end
-
-  function reset_instance(plugin_name, conf)
-    local key = type(conf) == "table" and conf.__key__ or plugin_name
-    instances[key] = nil
-  end
+local function reset_instance(plugin_name, conf)
+  local key = type(conf) == "table" and conf.__key__ or plugin_name
+  running_instances[key] = nil
+end
 
 
-  --- serverPid notification sent by the pluginserver.  if it changes,
-  --- all instances tied to this RPC socket should be restarted.
-  function rpc_notifications:serverPid(n)
-    n = tonumber(n)
-    if self.pluginserver_pid and n ~= self.pluginserver_pid then
-      for key, instance in pairs(instances) do
-        if instance.rpc == self then
-          instances[key] = nil
-        end
+--- serverPid notification sent by the pluginserver.  if it changes,
+--- all instances tied to this RPC socket should be restarted.
+function rpc_notifications:serverPid(n)
+  n = tonumber(n)
+  if self.pluginserver_pid and n ~= self.pluginserver_pid then
+    for key, instance in pairs(running_instances) do
+      if instance.rpc == self then
+        running_instances[key] = nil
       end
     end
-
-    self.pluginserver_pid = n
   end
+
+  self.pluginserver_pid = n
 end
+
 
 
 --[[
