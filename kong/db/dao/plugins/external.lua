@@ -413,20 +413,20 @@ no matter if actually enabled in Kong's configuration or not.
 
 
 local function register_plugin_info(server_def, plugin_info)
-  if _plugin_infos[plugin_info.name] then
+  if _plugin_infos[plugin_info.Name] then
     kong.log.error(string.format("Duplicate plugin name [%s] by %s and %s",
-      plugin_info.name, _plugin_infos[plugin_info.name].server_def.name, server_def.name))
+      plugin_info.Name, _plugin_infos[plugin_info.Name].server_def.name, server_def.name))
     return
   end
 
-  _plugin_infos[plugin_info.name] = {
+  _plugin_infos[plugin_info.Name] = {
     server_def = server_def,
     rpc = server_def.rpc,
-    name = plugin_info.name,
-    PRIORITY = plugin_info.priority,
-    VERSION = plugin_info.version,
-    schema = plugin_info.schema,
-    phases = plugin_info.phases,
+    name = plugin_info.Name,
+    PRIORITY = plugin_info.Priority,
+    VERSION = plugin_info.Version,
+    schema = plugin_info.Schema,
+    phases = plugin_info.Phases,
   }
 end
 
