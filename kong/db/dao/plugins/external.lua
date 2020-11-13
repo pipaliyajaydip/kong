@@ -10,6 +10,8 @@ local rpc = require "kong.db.dao.plugins.mp_rpc"
 local ngx = ngx
 local kong = kong
 local ngx_INFO = ngx.INFO
+local ngx_timer_at = ngx.timer.at
+local cjson_encode = cjson.encode
 
 --- module table
 local external_plugins = {}
@@ -28,6 +30,17 @@ local rpc_notifications = {}
 local running_instances = {}
 
 
+local function p_t(t)
+  local o = {tostring(t)}
+  if type(t) == "table" then
+    for k, v in pairs(t) do
+      o[#o+1] = string.format("\t[%q]:(%s)%q", tostring(k), type(v), tostring(v))
+    end
+  end
+
+  return table.concat(o, "\n")
+end
+
 
 --[[
 
@@ -44,6 +57,29 @@ env: (optional) a {string:string} map to be passed as environment variables.
 info_cmd: (optional) command line to request plugin info.
 
 --]]
+
+local function get_server_defs()
+  if not _servers then
+    if kong.configuration.external_plugins_config then
+      _servers = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
+
+    else
+      _servers = {}
+    end
+  end
+
+  return _servers
+end
+
+
+local function get_server_rpc(server_def)
+  if not server_def.rpc then
+    server_def.rpc = rpc.new(server_def.socket, rpc_notifications)
+    --kong.log.debug("server_def: ", server_def, "   .rpc: ", server_def.rpc)
+  end
+
+  return server_def.rpc
+end
 
 --[[
 
@@ -76,6 +112,7 @@ Instance_id/conf   relation
 --- instance.  Biggest complexity here is due to the remote (and thus non-atomic
 --- and fallible) operation of starting the instance at the server.
 local function get_instance_id(plugin_name, conf)
+  kong.log.debug("get_instance_id: ", plugin_name, " ", conf.__key__, "/", conf.__seq__)
   local key = type(conf) == "table" and conf.__key__ or plugin_name
   local instance_info = running_instances[key]
 
@@ -108,8 +145,11 @@ local function get_instance_id(plugin_name, conf)
   end
 
   local plugin_info = _plugin_infos[plugin_name]
+  local server_rpc  = get_server_rpc(plugin_info.server_def)
+  --kong.log.debug("plugin_info: ", p_t(plugin_info))
+  --kong.log.debug(".server_def: ", p_t(plugin_info.server_def))
 
-  local status, err = plugin_info.rpc:call("plugin.StartInstance", {
+  local status, err = server_rpc:call("plugin.StartInstance", {
     Name = plugin_name,
     Config = cjson_encode(conf)
   })
@@ -124,11 +164,11 @@ local function get_instance_id(plugin_name, conf)
   instance_info.conf = conf
   instance_info.seq = conf.__seq__
   instance_info.Config = status.Config
-  instance_info.rpc = plugin_info.rpc
+  instance_info.rpc = server_rpc
 
   if old_instance_id then
     -- there was a previous instance with same key, close it
-    plugin_info.rpc:call("plugin.CloseInstance", old_instance_id)
+    server_rpc:call("plugin.CloseInstance", old_instance_id)
     -- don't care if there's an error, maybe other thread closed it first.
   end
 
@@ -191,7 +231,7 @@ do
 
     ["kong.log.serialize"] = function()
       local saved = save_for_later[coroutine.running()]
-      return cjson.encode(saved and saved.serialize_data or kong.log.serialize())
+      return cjson_encode(saved and saved.serialize_data or kong.log.serialize())
     end,
 
     ["kong.nginx.get_var"] = function(v)
@@ -308,8 +348,11 @@ end
 
 --]]
 
-local function bridge_loop(rpc, instance_id, phase)
-  local step_in, err = rpc:call("plugin.HandleEvent", {
+local function bridge_loop(instance_rpc, instance_id, phase)
+  if not instance_rpc then
+    kong.log.err("no instance_rpc: ", debug.traceback())
+  end
+  local step_in, err = instance_rpc:call("plugin.HandleEvent", {
     InstanceId = instance_id,
     EventName = phase,
   })
@@ -330,7 +373,7 @@ local function bridge_loop(rpc, instance_id, phase)
 
     local step_method, step_res = get_step_method(step_in, pdk_res, pdk_err)
 
-    step_in, err = rpc:call(step_method, {
+    step_in, err = instance_rpc:call(step_method, {
       EventId = event_id,
       Data = step_res,
     })
@@ -341,16 +384,16 @@ local function bridge_loop(rpc, instance_id, phase)
 end
 
 
-local function handle_event(rpc, plugin_name, conf, phase)
+local function handle_event(instance_rpc, plugin_name, conf, phase)
   local instance_id = get_instance_id(plugin_name, conf)
-  local _, err = bridge_loop(rpc, instance_id, phase)
+  local _, err = bridge_loop(instance_rpc, instance_id, phase)
 
   if err then
     kong.log.err(err)
 
     if string.match(err, "No plugin instance") then
       reset_instance(plugin_name, conf)
-      return handle_event(rpc, plugin_name, conf, phase)
+      return handle_event(instance_rpc, plugin_name, conf, phase)
     end
   end
 end
@@ -375,7 +418,7 @@ local function build_phases(plugin)
           local co = coroutine.running()
           save_for_later[co] = saved
 
-          handle_event(self.name, conf, phase)
+          handle_event(self.server_def.rpc, self.name, conf, phase)
 
           save_for_later[co] = nil
         end)
@@ -383,7 +426,7 @@ local function build_phases(plugin)
 
     else
       plugin[phase] = function(self, conf)
-        handle_event(self.rpc, self.name, conf, phase)
+        handle_event(self.server_def.rpc, self.name, conf, phase)
       end
     end
   end
@@ -436,7 +479,7 @@ local function register_plugin_info(server_def, plugin_info)
 
   _plugin_infos[plugin_info.Name] = {
     server_def = server_def,
-    rpc = server_def.rpc,
+    --rpc = server_def.rpc,
     name = plugin_info.Name,
     PRIORITY = plugin_info.Priority,
     VERSION = plugin_info.Version,
@@ -468,21 +511,17 @@ local function ask_info(server_def)
   end
 
   for _, plugin_info in ipairs(infos) do
+    kong.log.debug("plugin_info: ", p_t(plugin_info), "\n server_def: ", p_t(server_def))
     register_plugin_info(server_def, plugin_info)
   end
 end
 
 local function load_all_infos()
-
   if not _plugin_infos then
     _plugin_infos = {}
 
-    if kong.configuration.external_plugins_config then
-      local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
-
-      for _, server_def in ipairs(conf) do
-        ask_info(server_def)
-      end
+    for _, server_def in ipairs(get_server_defs()) do
+      ask_info(server_def)
     end
   end
 
@@ -554,7 +593,7 @@ local function handle_server(server_def)
   end
 
   if server_def.exec then
-    ngx.timer.at(0, function(premature)
+    ngx_timer_at(0, function(premature)
       if premature then
         return
       end
@@ -565,10 +604,11 @@ local function handle_server(server_def)
         kong.log.notice("Starting " .. server_def.name or "")
         server_def.proc = assert(ngx_pipe.spawn({
           server_def.exec, table.unpack(server_def.args or {})
-        }, { environ = server_def.environment }))
+        }, {
+          environ = server_def.environment,
+          merge_stderr = true,
+        }))
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
-
-        server_def.rpc = rpc.new(server_def.socket, rpc_notifications)
 
         while true do
           grab_logs(server_def.proc)
@@ -591,30 +631,32 @@ function external_plugins.manage_servers()
     kong.log.notice("only worker #0 can manage")
     return
   end
-  assert(not _servers, "don't call manage_servers() more than once")
-  _servers = {}
+  --assert(not _servers, "don't call manage_servers() more than once")
+  --_servers = {}
 
   if not kong.configuration.external_plugins_config then
     kong.log.info("no external plugins")
     return
   end
 
-  local content = assert(pl_file.read(kong.configuration.external_plugins_config))
-  local conf = lyaml.load(content)
+  --local content = assert(pl_file.read(kong.configuration.external_plugins_config))
+  --local conf = lyaml.load(content)
+  --
+  --print("conf! ", logging.tostring(conf))
 
-  print("conf! ", logging.tostring(conf))
-
-  for i, server_def in ipairs(conf) do
+  for i, server_def in ipairs(get_server_defs()) do
     if not server_def.name then
       server_def.name = string.format("plugin server #%d", i)
     end
 
+    kong.log.debug("will start server: ", p_t(server_def))
     local server, err = handle_server(server_def)
     if not server then
       kong.log.err(err)
     else
 
-      _servers[#_servers + 1] = server
+      kong.log.debug("started server: ", p_t(server))
+      --_servers[#_servers + 1] = server
     end
   end
 end

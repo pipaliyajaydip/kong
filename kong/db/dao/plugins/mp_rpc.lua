@@ -10,6 +10,7 @@ Rpc.__index = Rpc
 Rpc.notifications_callbacks = {}
 
 function Rpc.new(socket_path, notifications)
+  kong.log.debug("mp_rpc.new: ", socket_path)
   return setmetatable({
     socket_path = socket_path,
     msg_id = 0,
@@ -56,7 +57,7 @@ function Rpc:call(method, ...)
   end
 
   -- request: [ 0, msg_id, method, args ]
-  local bytes, err = c:send(mp_pack({0, my_msg_id, method, {...}}))
+  local bytes, err = c:send(mp_pack({0, self.msg_id, method, {...}}))
   if not bytes then
     c:setkeepalive()
     return nil, err
@@ -71,17 +72,17 @@ function Rpc:call(method, ...)
     local ok, data = reader()
     if not ok then
       c:setkeepalive()
-      return nil, data
+      return nil, "no data"
     end
 
     if data[1] == 2 then
       -- notification: [ 2, label, args ]
-      self:got_notification(data[2], data[3])
+      self:notification(data[2], data[3])
 
     else
       -- response: [ 1, msg_id, error, result ]
       assert(data[1] == 1, "RPC response expected from Go plugin server")
-      assert(data[2] == my_msg_id,
+      assert(data[2] == self.msg_id,
              "unexpected RPC response ID from Go plugin server")
 
       -- it's our answer
@@ -98,9 +99,9 @@ end
 
 
 function Rpc:notification(label, args)
-  local f = self.notifications_callbacks[data[2]]
+  local f = self.notifications_callbacks[label]
   if f then
-    f(self, data[3])
+    f(self, args)
   end
 end
 
