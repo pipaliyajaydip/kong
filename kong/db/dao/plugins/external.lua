@@ -1,9 +1,11 @@
+local cjson = require "cjson.safe"
+local ngx_ssl = require "ngx.ssl"
 local pl_file = require "pl.file"
 local lyaml = require "lyaml"
 local raw_log = require "ngx.errlog".raw_log
 
 local logging = require "logging"
-local rpc = require "mp_rpc"
+local rpc = require "kong.db.dao.plugins.mp_rpc"
 
 local ngx = ngx
 local kong = kong
@@ -188,7 +190,8 @@ do
     kong = kong,
 
     ["kong.log.serialize"] = function()
-      return cjson_encode(preloaded_stuff.basic_serializer or basic_serializer.serialize(ngx))
+      local saved = save_for_later[coroutine.running()]
+      return cjson.encode(saved and saved.serialize_data or kong.log.serialize())
     end,
 
     ["kong.nginx.get_var"] = function(v)
@@ -198,19 +201,27 @@ do
     ["kong.nginx.get_tls1_version_str"] = ngx_ssl.get_tls1_version_str,
 
     ["kong.nginx.get_ctx"] = function(k)
-      return ngx.ctx[k]
+      local saved = save_for_later[coroutine.running()]
+      local ngx_ctx = saved and saved.ngx_ctx or ngx.ctx
+      return ngx_ctx[k]
     end,
 
     ["kong.nginx.set_ctx"] = function(k, v)
-      ngx.ctx[k] = v
+      local saved = save_for_later[coroutine.running()]
+      local ngx_ctx = saved and saved.ngx_ctx or ngx.ctx
+      ngx_ctx[k] = v
     end,
 
     ["kong.ctx.shared.get"] = function(k)
-      return kong.ctx.shared[k]
+      local saved = save_for_later[coroutine.running()]
+      local ctx_shared = saved and saved.ctx_shared or kong.ctx.shared
+      return ctx_shared[k]
     end,
 
     ["kong.ctx.shared.set"] = function(k, v)
-      kong.ctx.shared[k] = v
+      local saved = save_for_later[coroutine.running()]
+      local ctx_shared = saved and saved.ctx_shared or kong.ctx.shared
+      ctx_shared[k] = v
     end,
 
     ["kong.nginx.req_start_time"] = ngx.req.start_time,
@@ -347,6 +358,10 @@ end
 
 --- Phase closures
 local function build_phases(plugin)
+  if not plugin then
+    return
+  end
+
   for _, phase in ipairs(plugin.phases) do
     if phase == "log" then
       plugin[phase] = function(self, conf)
@@ -414,7 +429,7 @@ no matter if actually enabled in Kong's configuration or not.
 
 local function register_plugin_info(server_def, plugin_info)
   if _plugin_infos[plugin_info.Name] then
-    kong.log.error(string.format("Duplicate plugin name [%s] by %s and %s",
+    kong.log.err(string.format("Duplicate plugin name [%s] by %s and %s",
       plugin_info.Name, _plugin_infos[plugin_info.Name].server_def.name, server_def.name))
     return
   end
@@ -439,7 +454,7 @@ local function ask_info(server_def)
   local fd, err = io.popen(server_def.info_cmd)
   if not fd then
     local msg = string.format("loading plugins info from [%s]:\n", server_def.name)
-    kong.log.error(msg, err)
+    kong.log.err(msg, err)
     return
   end
 
@@ -447,7 +462,7 @@ local function ask_info(server_def)
   fd:close()
   local infos = lyaml.load(infos_dump)
   if type(infos) ~= "table" then
-    kong.log.error(string.format("Not a plugin info table: \n%s\n%s",
+    error(string.format("Not a plugin info table: \n%s\n%s",
         server_def.info_cmd, infos_dump))
     return
   end
@@ -458,17 +473,16 @@ local function ask_info(server_def)
 end
 
 local function load_all_infos()
-  if not kong.configuration.external_plugins_config then
-    kong.log.info("no external plugins")
-    return
-  end
 
   if not _plugin_infos then
-    local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
     _plugin_infos = {}
 
-    for _, server_def in ipairs(conf) do
-      ask_info(server_def)
+    if kong.configuration.external_plugins_config then
+      local conf = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
+
+      for _, server_def in ipairs(conf) do
+        ask_info(server_def)
+      end
     end
   end
 
@@ -478,7 +492,7 @@ end
 
 local loaded_plugins = {}
 
-function external_plugins.load_plugin(plugin_name)
+local function get_plugin(plugin_name)
   if not loaded_plugins[plugin_name] then
     local plugin = load_all_infos()[plugin_name]
     loaded_plugins[plugin_name] = build_phases(plugin)
@@ -487,9 +501,22 @@ function external_plugins.load_plugin(plugin_name)
   return loaded_plugins[plugin_name]
 end
 
+function external_plugins.load_plugin(plugin_name)
+  local plugin = get_plugin(plugin_name)
+  if plugin and plugin.PRIORITY then
+    return true, plugin
+  end
+
+  return false, "no plugin found"
+end
+
 function external_plugins.load_schema(plugin_name)
-  local plugin_info = external_plugins.load_plugin(plugin_name)
-  return plugin_info and plugin_info.schema
+  local plugin = get_plugin(plugin_name)
+  if plugin and plugin.PRIORITY then
+    return true, plugin.schema
+  end
+
+  return false, "no plugin found"
 end
 
 
@@ -527,7 +554,7 @@ local function handle_server(server_def)
   end
 
   if server_def.exec then
-    ngx_timer_at(0, function(premature)
+    ngx.timer.at(0, function(premature)
       if premature then
         return
       end
@@ -584,7 +611,7 @@ function external_plugins.manage_servers()
 
     local server, err = handle_server(server_def)
     if not server then
-      kong.log.error(err)
+      kong.log.err(err)
     else
 
       _servers[#_servers + 1] = server

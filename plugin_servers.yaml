@@ -1,12 +1,17 @@
 
 - name: first
-  socket: /tmp/blah.sock
-  exec: xxx
+  socket: /usr/local/kong/go_pluginserver.sock
+  exec: /usr/local/bin/go-pluginserver
   environment:
-    HINT: dont
-  args:
-    go
-  info_cmd: xxx --get_plugins_info
+  args: [ "-plugins-directory", "/usr/local/kong/go-plugins/" ]
+  info_cmd: go-pluginserver -plugins-directory /usr/local/kong/go-plugins -dump-all-plugins
+
+- name: second
+  socket: /tmp/go_pluginserver.sock
+  exec: /usr/local/bin/go-pluginserver
+  environment:
+  args: [ "-plugins-directory", "/home/javier/devel/kong_dev/kong/spec/fixtures/go", "-kong-prefix", "/tmp" ]
+  info_cmd: go-pluginserver -plugins-directory /home/javier/devel/kong_dev/kong/spec/fixtures/go -dump-all-plugins
 
 - name: sec
   socket: /tmp/that.sock
