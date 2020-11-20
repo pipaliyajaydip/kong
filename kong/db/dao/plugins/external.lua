@@ -112,7 +112,6 @@ Instance_id/conf   relation
 --- instance.  Biggest complexity here is due to the remote (and thus non-atomic
 --- and fallible) operation of starting the instance at the server.
 local function get_instance_id(plugin_name, conf)
-  kong.log.debug("get_instance_id: ", plugin_name, " ", conf.__key__, "/", conf.__seq__)
   local key = type(conf) == "table" and conf.__key__ or plugin_name
   local instance_info = running_instances[key]
 
@@ -146,8 +145,6 @@ local function get_instance_id(plugin_name, conf)
 
   local plugin_info = _plugin_infos[plugin_name]
   local server_rpc  = get_server_rpc(plugin_info.server_def)
-  --kong.log.debug("plugin_info: ", p_t(plugin_info))
-  --kong.log.debug(".server_def: ", p_t(plugin_info.server_def))
 
   local status, err = server_rpc:call("plugin.StartInstance", {
     Name = plugin_name,
@@ -405,6 +402,8 @@ local function build_phases(plugin)
     return
   end
 
+  local server_rpc = get_server_rpc(plugin.server_def)
+
   for _, phase in ipairs(plugin.phases) do
     if phase == "log" then
       plugin[phase] = function(self, conf)
@@ -418,7 +417,7 @@ local function build_phases(plugin)
           local co = coroutine.running()
           save_for_later[co] = saved
 
-          handle_event(self.server_def.rpc, self.name, conf, phase)
+          handle_event(server_rpc, self.name, conf, phase)
 
           save_for_later[co] = nil
         end)
@@ -426,7 +425,7 @@ local function build_phases(plugin)
 
     else
       plugin[phase] = function(self, conf)
-        handle_event(self.server_def.rpc, self.name, conf, phase)
+        handle_event(server_rpc, self.name, conf, phase)
       end
     end
   end
@@ -511,7 +510,6 @@ local function ask_info(server_def)
   end
 
   for _, plugin_info in ipairs(infos) do
-    kong.log.debug("plugin_info: ", p_t(plugin_info), "\n server_def: ", p_t(server_def))
     register_plugin_info(server_def, plugin_info)
   end
 end
@@ -572,12 +570,14 @@ and respawns the server.
 
 --]]
 
-local function grab_logs(proc)
+local function grab_logs(proc, name)
+  local prefix = string.format("[%s:%d] ", name, proc:pid())
+
   while true do
     local data, err, partial = proc:stdout_read_line()
     local line = data or partial
     if line and line ~= "" then
-      raw_log(ngx_INFO, "[go-pluginserver] " .. line)
+      raw_log(ngx_INFO, prefix .. line)
     end
 
     if not data and err == "closed" then
@@ -611,7 +611,7 @@ local function handle_server(server_def)
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
 
         while true do
-          grab_logs(server_def.proc)
+          grab_logs(server_def.proc, server_def.name)
           local ok, reason, status = server_def.proc:wait()
           if ok ~= nil or reason == "exited" then
             kong.log.notice("external pluginserver '", server_def.name, "' terminated: ", tostring(reason), " ", tostring(status))
@@ -631,32 +631,20 @@ function external_plugins.manage_servers()
     kong.log.notice("only worker #0 can manage")
     return
   end
-  --assert(not _servers, "don't call manage_servers() more than once")
-  --_servers = {}
 
   if not kong.configuration.external_plugins_config then
     kong.log.info("no external plugins")
     return
   end
 
-  --local content = assert(pl_file.read(kong.configuration.external_plugins_config))
-  --local conf = lyaml.load(content)
-  --
-  --print("conf! ", logging.tostring(conf))
-
   for i, server_def in ipairs(get_server_defs()) do
     if not server_def.name then
       server_def.name = string.format("plugin server #%d", i)
     end
 
-    kong.log.debug("will start server: ", p_t(server_def))
     local server, err = handle_server(server_def)
     if not server then
       kong.log.err(err)
-    else
-
-      kong.log.debug("started server: ", p_t(server))
-      --_servers[#_servers + 1] = server
     end
   end
 end
