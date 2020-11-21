@@ -20,6 +20,20 @@ end
 
 
 
+-- add MessagePack empty array/map
+
+msgpack.packers['function'] = function (buffer, f)
+  f(buffer)
+end
+
+local function mp_empty_array(buffer)
+  msgpack.packers['array'](buffer, {}, 0)
+end
+
+local function mp_empty_map(buffer)
+  msgpack.packers['map'](buffer, {}, 0)
+end
+
 --- fix_mmap(t) : preprocess complex maps
 function Rpc.fix_mmap(t)
   local o, empty = {}, true
