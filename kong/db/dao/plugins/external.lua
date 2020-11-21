@@ -4,11 +4,11 @@ local pl_file = require "pl.file"
 local lyaml = require "lyaml"
 local raw_log = require "ngx.errlog".raw_log
 
-local logging = require "logging"
 local rpc = require "kong.db.dao.plugins.mp_rpc"
 
 local ngx = ngx
 local kong = kong
+local unpack = unpack
 local ngx_INFO = ngx.INFO
 local ngx_timer_at = ngx.timer.at
 local cjson_encode = cjson.encode
@@ -28,18 +28,6 @@ local rpc_notifications = {}
 
 --- currently running plugin instances
 local running_instances = {}
-
-
-local function p_t(t)
-  local o = {tostring(t)}
-  if type(t) == "table" then
-    for k, v in pairs(t) do
-      o[#o+1] = string.format("\t[%q]:(%s)%q", tostring(k), type(v), tostring(v))
-    end
-  end
-
-  return table.concat(o, "\n")
-end
 
 
 --[[
@@ -603,7 +591,7 @@ local function handle_server(server_def)
       while not ngx.worker.exiting() do
         kong.log.notice("Starting " .. server_def.name or "")
         server_def.proc = assert(ngx_pipe.spawn({
-          server_def.exec, table.unpack(server_def.args or {})
+          server_def.exec, unpack(server_def.args or {})
         }, {
           environ = server_def.environment,
           merge_stderr = true,
