@@ -122,7 +122,7 @@
                                  # cache (i.e. when the configured
                                  # `mem_cache_size`) is full.
 
-#external_plugins_config =
+#pluginserver_names =
 
 #go_pluginserver_exe = /usr/local/bin/go-pluginserver
                                  # Path for the go-pluginserver executable,

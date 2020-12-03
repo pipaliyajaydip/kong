@@ -1,7 +1,6 @@
 local cjson = require "cjson.safe"
 local ngx_ssl = require "ngx.ssl"
-local pl_file = require "pl.file"
-local lyaml = require "lyaml"
+local pl_path = require "pl.path"
 local raw_log = require "ngx.errlog".raw_log
 
 local rpc = require "kong.db.dao.plugins.mp_rpc"
@@ -12,6 +11,7 @@ local unpack = unpack
 local ngx_INFO = ngx.INFO
 local ngx_timer_at = ngx.timer.at
 local cjson_encode = cjson.encode
+local cjson_decode = cjson.decode
 
 --- module table
 local external_plugins = {}
@@ -46,13 +46,29 @@ info_cmd: (optional) command line to request plugin info.
 
 --]]
 
-local function get_server_defs()
-  if not _servers then
-    if kong.configuration.external_plugins_config then
-      _servers = lyaml.load(assert(pl_file.read(kong.configuration.external_plugins_config)))
+local function ifexists(path)
+  if pl_path.exists(path) then
+    return path
+  end
+end
 
-    else
-      _servers = {}
+local conf_loader = require "kong.conf_loader"
+
+
+local function get_server_defs()
+  local config = kong.configuration
+
+  if not _servers then
+    _servers = {}
+    for i, name in ipairs(config.pluginserver_names or {}) do
+      kong.log.debug("search config for pluginserver named: ", name)
+      local env_prefix = "pluginserver_" .. name
+      _servers[i] = {
+        name = name,
+        socket = config[env_prefix .. "_socket"] or "/usr/local/kong/" .. name .. ".socket",
+        start_command = config[env_prefix .. "_start_cmd"] or ifexists("/usr/local/bin/"..name),
+        query_command = config[env_prefix .. "_query_cmd"] or ifexists("/usr/local/bin/query_"..name),
+      }
     end
   end
 
@@ -476,12 +492,12 @@ local function register_plugin_info(server_def, plugin_info)
 end
 
 local function ask_info(server_def)
-  if not server_def.info_cmd then
+  if not server_def.query_command then
     kong.log.info(string.format("No info query for %s", server_def.name))
     return
   end
 
-  local fd, err = io.popen(server_def.info_cmd)
+  local fd, err = io.popen(server_def.query_command)
   if not fd then
     local msg = string.format("loading plugins info from [%s]:\n", server_def.name)
     kong.log.err(msg, err)
@@ -490,10 +506,10 @@ local function ask_info(server_def)
 
   local infos_dump = fd:read("*a")
   fd:close()
-  local infos = lyaml.load(infos_dump)
+  local infos = cjson_decode(infos_dump)
   if type(infos) ~= "table" then
     error(string.format("Not a plugin info table: \n%s\n%s",
-        server_def.info_cmd, infos_dump))
+        server_def.query_command, infos_dump))
     return
   end
 
@@ -580,7 +596,7 @@ local function handle_server(server_def)
     return
   end
 
-  if server_def.exec then
+  if server_def.start_command then
     ngx_timer_at(0, function(premature)
       if premature then
         return
@@ -590,10 +606,7 @@ local function handle_server(server_def)
 
       while not ngx.worker.exiting() do
         kong.log.notice("Starting " .. server_def.name or "")
-        server_def.proc = assert(ngx_pipe.spawn({
-          server_def.exec, unpack(server_def.args or {})
-        }, {
-          environ = server_def.environment,
+        server_def.proc = assert(ngx_pipe.spawn(server_def.start_command, {
           merge_stderr = true,
         }))
         server_def.proc:set_timeouts(nil, nil, nil, 0)     -- block until something actually happens
@@ -620,16 +633,7 @@ function external_plugins.manage_servers()
     return
   end
 
-  if not kong.configuration.external_plugins_config then
-    kong.log.info("no external plugins")
-    return
-  end
-
   for i, server_def in ipairs(get_server_defs()) do
-    if not server_def.name then
-      server_def.name = string.format("plugin server #%d", i)
-    end
-
     local server, err = handle_server(server_def)
     if not server then
       kong.log.err(err)

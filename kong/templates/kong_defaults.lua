@@ -164,4 +164,5 @@ lua_package_cpath = NONE
 
 role = traditional
 kic = off
+pluginserver_names = NONE
 ]]
