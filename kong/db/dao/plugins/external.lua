@@ -52,8 +52,6 @@ local function ifexists(path)
   end
 end
 
-local conf_loader = require "kong.conf_loader"
-
 
 local function get_server_defs()
   local config = kong.configuration
